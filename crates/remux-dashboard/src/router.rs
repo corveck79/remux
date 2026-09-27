@@ -37,6 +37,8 @@ pub enum Route {
     SettingsBrandingRoute,
     #[route("/settings/webhooks")]
     SettingsWebhooksRoute,
+    #[route("/settings/trackers")]
+    SettingsTrackersRoute,
     #[route("/access/users")]
     AccessUsersRoute,
     #[route("/access/apikeys")]
@@ -134,6 +136,12 @@ pub(crate) fn SettingsBrandingRoute() -> Element {
 pub(crate) fn SettingsWebhooksRoute() -> Element {
     let app_state = use_context::<AppState>();
     rsx! { WebhooksPage { app_state } }
+}
+
+#[component]
+pub(crate) fn SettingsTrackersRoute() -> Element {
+    let app_state = use_context::<AppState>();
+    rsx! { MediaTrackersCard { app_state } }
 }
 
 #[component]

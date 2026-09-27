@@ -110,6 +110,7 @@ pub fn DashboardLayout() -> Element {
         Route::SettingsWebhooksRoute => "Webhooks",
         Route::SettingsIntroRoute => "Intro",
         Route::SettingsRemuxdbRoute => "Remuxdb",
+        Route::SettingsTrackersRoute => "Media Trackers",
         Route::AccessUsersRoute => "Users",
         Route::AccessApiKeysRoute => "API Keys",
         Route::TasksRoute => "Tasks",
@@ -194,6 +195,7 @@ pub fn DashboardLayout() -> Element {
                             | Route::SettingsWebhooksRoute
                             | Route::SettingsIntroRoute
                             | Route::SettingsRemuxdbRoute
+                            | Route::SettingsTrackersRoute
                         ),
                         NavSubItem {
                             label: "General",
@@ -234,6 +236,11 @@ pub fn DashboardLayout() -> Element {
                             label: "Webhooks",
                             active: route == Route::SettingsWebhooksRoute,
                             on_click: move |_| { navigator().push(Route::SettingsWebhooksRoute); sidebar_open.set(false); },
+                        }
+                        NavSubItem {
+                            label: "Media Trackers",
+                            active: route == Route::SettingsTrackersRoute,
+                            on_click: move |_| { navigator().push(Route::SettingsTrackersRoute); sidebar_open.set(false); },
                         }
                     }
 
