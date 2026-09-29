@@ -221,7 +221,22 @@ impl StremioService {
             elapsed = ?t0.elapsed(),
             "catalog first page"
         );
-        if page_size == 0 || !supports_skip {
+        // `supports_skip` (the manifest's own declared `extra: [{name:
+        // "skip"}]`) is no longer a hard gate — verified directly against a
+        // live addon (AIOStreams) whose manifest declares no `extra` fields
+        // at all for a catalog, yet `?skip=N` demonstrably works and returns
+        // further pages; trusting the declaration alone silently truncated
+        // every such catalog at its first page. Pagination is attempted
+        // whenever the first page came back non-empty, regardless of the
+        // declaration — an addon that genuinely doesn't support `skip` still
+        // terminates cleanly on its very next page via the existing 404/
+        // empty-page handling below (see `get_catalog_stream_stops_cleanly_on_404`),
+        // same as it always has; the only cost for that addon is one now-
+        // unnecessary page 2 request before that. `supports_skip` is kept as
+        // a parameter (and still passed through) for that debug/observability
+        // value, not as a behavioral gate.
+        let _ = supports_skip;
+        if page_size == 0 {
             return Ok(Box::pin(stream::iter(first_page.metas)));
         }
 

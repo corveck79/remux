@@ -962,7 +962,28 @@ pub struct ExternalIds {
 impl ExternalIds {
     /// Parse an AIO `meta.id` string into external provider IDs using the
     /// standard Stremio/Jellyfin prefix conventions.
+    ///
+    /// AIOStreams (and possibly other Stremio-protocol addons) signals a
+    /// lookup failure by returning a synthetic meta object — id prefixed
+    /// `aiostreamserror.` — instead of a proper HTTP error, so a catalog or
+    /// meta-refresh response that fails partway still looks like ordinary
+    /// data to everything downstream. Recognizing it here, at the one
+    /// function every such response's id passes through, keeps a lookup
+    /// failure from being treated as a real id at any of its several call
+    /// sites: it can't seed a synthetic "movie" with a title like
+    /// "[❌] The Movie Database" (`import_catalog_items`'s kind/title
+    /// filtering has nothing stremio-specific to reject it on), and —
+    /// because `external_ids` merges are additive (`widen_external_ids`,
+    /// `Media::save`'s `json_patch`) — a refresh that fails for an item
+    /// already in the library can't graft the error string onto its real
+    /// custom_stremio_id either. Default::default() (no ids at all) is the
+    /// correct empty result either way: a widen-merge with nothing set
+    /// touches nothing, and a fresh item with no ids at all is exactly as
+    /// unidentifiable as this response actually was.
     pub fn from_stremio_id(id: &str) -> Self {
+        if id.starts_with("aiostreamserror.") {
+            return Self::default();
+        }
         if id.starts_with("tt") {
             return Self {
                 imdb: NonEmptyString::try_new(id.to_string()).ok(),
@@ -5129,26 +5150,36 @@ impl Media {
                 .iter()
                 .map(|m| m.id)
                 .collect();
-            let mut tags_qb = sqlx::QueryBuilder::new(
-                "SELECT media_id, tag FROM media_tags WHERE media_id IN (",
-            );
-            let mut sep = tags_qb.separated(", ");
-            for id in &ids {
-                sep.push_bind(id);
-            }
-            tags_qb.push(") ORDER BY tag");
-            let tag_rows = tags_qb
-                .build()
-                .fetch_all(db)
-                .await?;
+            // Chunked well under SQLite's ~999 bound-parameter limit — `ids`
+            // is sized by the whole result set, which for an unfiltered
+            // large library (e.g. tens of thousands of Live TV channels)
+            // can easily exceed that in one call.
+            const TAG_ID_CHUNK: usize = 900;
             let mut tags_map: HashMap<Uuid, Vec<String>> = HashMap::new();
-            for row in tag_rows {
-                let media_id: Uuid = row.get(0);
-                let tag: String = row.get(1);
-                tags_map
-                    .entry(media_id)
-                    .or_default()
-                    .push(tag);
+            for chunk in ids.chunks(TAG_ID_CHUNK) {
+                let mut tags_qb = sqlx::QueryBuilder::new(
+                    "SELECT media_id, tag FROM media_tags WHERE media_id IN (",
+                );
+                let mut sep = tags_qb.separated(", ");
+                for id in chunk {
+                    sep.push_bind(id);
+                }
+                tags_qb.push(")");
+                let tag_rows = tags_qb
+                    .build()
+                    .fetch_all(db)
+                    .await?;
+                for row in tag_rows {
+                    let media_id: Uuid = row.get(0);
+                    let tag: String = row.get(1);
+                    tags_map
+                        .entry(media_id)
+                        .or_default()
+                        .push(tag);
+                }
+            }
+            for tags in tags_map.values_mut() {
+                tags.sort();
             }
             for media in &mut records {
                 if let Some(tags) = tags_map.remove(&media.id) {

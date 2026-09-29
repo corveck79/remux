@@ -8,6 +8,7 @@ pub mod iptv;
 pub mod settings;
 pub mod streaming;
 pub mod streams;
+pub mod trackers;
 pub mod users;
 pub mod webhooks;
 
@@ -45,5 +46,6 @@ pub use settings::{
 };
 pub use streaming::StreamingGeneralSettingsPage;
 pub use streams::StreamGroupsCard;
+pub use trackers::MediaTrackersCard;
 pub use users::UsersPage;
 pub use webhooks::WebhooksPage;

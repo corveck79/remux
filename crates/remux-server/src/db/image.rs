@@ -54,6 +54,14 @@ impl MediaImage {
     }
 
     /// Batch-load images for a set of media IDs.
+    ///
+    /// Chunked well under SQLite's ~999 bound-parameter limit — a caller
+    /// with a large unfiltered result set (e.g. a Live TV library with tens
+    /// of thousands of channels) can easily pass more ids than that in one
+    /// call; unchunked, that failed outright with "too many SQL variables"
+    /// and took the whole request down with it (`/Users/{id}/Views` among
+    /// them, since it always loads the Live TV channel count alongside the
+    /// library list).
     pub async fn get_for_media_ids(
         db: &SqlitePool,
         ids: &[Uuid],
@@ -61,24 +69,27 @@ impl MediaImage {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let mut qb = sqlx::QueryBuilder::new(
-            "SELECT id, media_id, image_type, image_index, path, width, height \
-             FROM media_images WHERE media_id IN (",
-        );
-        let mut sep = qb.separated(", ");
-        for id in ids {
-            sep.push_bind(id);
-        }
-        qb.push(") ORDER BY media_id, image_type, image_index");
-        let rows = qb
-            .build_query_as::<Self>()
-            .fetch_all(db)
-            .await?;
+        const ID_CHUNK: usize = 900;
         let mut flat: HashMap<Uuid, Vec<Self>> = HashMap::new();
-        for row in rows {
-            flat.entry(row.media_id)
-                .or_default()
-                .push(row);
+        for chunk in ids.chunks(ID_CHUNK) {
+            let mut qb = sqlx::QueryBuilder::new(
+                "SELECT id, media_id, image_type, image_index, path, width, height \
+                 FROM media_images WHERE media_id IN (",
+            );
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id);
+            }
+            qb.push(") ORDER BY media_id, image_type, image_index");
+            let rows = qb
+                .build_query_as::<Self>()
+                .fetch_all(db)
+                .await?;
+            for row in rows {
+                flat.entry(row.media_id)
+                    .or_default()
+                    .push(row);
+            }
         }
         Ok(flat
             .into_iter()

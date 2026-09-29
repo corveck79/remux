@@ -7298,6 +7298,166 @@ impl Endpoint for RegenerateCollectionImage {
     }
 }
 
+// --- Media trackers (Trakt, and any other MediaTrackerAddon provider) ---
+//
+// Shared by the server (`api/media_trackers.rs`, which returns these DTOs
+// directly) and the dashboard (`pages/trackers.rs`, which calls these
+// endpoints), so the two sides can never drift on field names.
+
+/// One media-tracker-capable addon, joined with the calling user's own
+/// connection to it when one exists.
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaTrackerProviderDto {
+    pub addon_id: Uuid,
+    pub kind: String,
+    pub display_name: String,
+    pub connected: bool,
+    pub status: Option<MediaTrackerStatusDto>,
+    pub last_error: Option<String>,
+    pub event_filters: Vec<MediaTrackerEventKindDto>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaTrackerStatusDto {
+    Disconnected,
+    Connected,
+    Error,
+    AuthExpired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaTrackerEventKindDto {
+    PlaybackStart,
+    PlaybackProgress,
+    PlaybackStop,
+    MarkPlayed,
+    MarkUnplayed,
+    MarkFavorite,
+    UnmarkFavorite,
+    Rating,
+}
+
+/// `GET /media-trackers` — every enabled media-tracker-capable addon.
+#[derive(Debug, Clone, Default)]
+pub struct ListMediaTrackers;
+
+impl Endpoint for ListMediaTrackers {
+    type Output = Vec<MediaTrackerProviderDto>;
+    fn path(&self) -> String {
+        "/media-trackers".into()
+    }
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceAuthStartDto {
+    pub verification_url: String,
+    pub user_code: String,
+    pub poll_token: String,
+    pub interval_secs: u64,
+    pub expires_in_secs: u64,
+}
+
+/// `POST /media-trackers/{addonId}/connect/device`
+#[derive(Debug, Clone)]
+pub struct BeginDeviceAuth {
+    pub addon_id: Uuid,
+}
+
+impl Endpoint for BeginDeviceAuth {
+    type Output = DeviceAuthStartDto;
+    fn path(&self) -> String {
+        format!("/media-trackers/{}/connect/device", self.addon_id)
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevicePollStatusDto {
+    Pending,
+    Connected,
+    Denied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevicePollResultDto {
+    pub status: DevicePollStatusDto,
+}
+
+/// `POST /media-trackers/{addonId}/connect/device/poll?pollToken=...`
+#[derive(Debug, Clone)]
+pub struct PollDeviceAuth {
+    pub addon_id: Uuid,
+    pub poll_token: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PollDeviceAuthQuery<'a> {
+    #[serde(rename = "pollToken")]
+    poll_token: &'a str,
+}
+
+impl Endpoint for PollDeviceAuth {
+    type Output = DevicePollResultDto;
+    fn path(&self) -> String {
+        format!("/media-trackers/{}/connect/device/poll", self.addon_id)
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        PollDeviceAuthQuery {
+            poll_token: &self.poll_token,
+        }
+    }
+}
+
+/// `DELETE /media-trackers/{addonId}`
+#[derive(Debug, Clone)]
+pub struct DisconnectMediaTracker {
+    pub addon_id: Uuid,
+}
+
+impl Endpoint for DisconnectMediaTracker {
+    type Output = ();
+    fn path(&self) -> String {
+        format!("/media-trackers/{}", self.addon_id)
+    }
+    fn method(&self) -> Method {
+        Method::DELETE
+    }
+}
+
+/// `POST /media-trackers/{addonId}/filters`
+#[derive(Debug, Clone, Serialize)]
+pub struct SetMediaTrackerFilters {
+    #[serde(skip)]
+    pub addon_id: Uuid,
+    pub event_filters: Vec<MediaTrackerEventKindDto>,
+}
+
+impl Endpoint for SetMediaTrackerFilters {
+    type Output = ();
+    fn path(&self) -> String {
+        format!("/media-trackers/{}/filters", self.addon_id)
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::json!({ "eventFilters": self.event_filters }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

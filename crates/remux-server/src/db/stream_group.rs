@@ -2,8 +2,8 @@ use anyhow::Result;
 use chrono::Utc;
 use remux_sdks::remux::{
     FilterMatchMode, NumericOp, SetOp, StreamCodec, StreamFilter, StreamQuality,
-    StreamResolution, StreamRule, format_size_rule, language_label,
-    normalize_lang_code,
+    StreamResolution, StreamRule, common_audio_languages, format_size_rule,
+    language_label, normalize_lang_code,
 };
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -389,35 +389,135 @@ impl StreamGroup {
                     let hit = values.contains(&codec);
                     bool_to_outcome(matches!(op, SetOp::In | SetOp::Is) == hit)
                 }
-                // No probe data → PassThrough: we can't confirm or deny the
-                // language, so the source must not be absorbed by the group
-                // (which shows only one representative) but also must not be
-                // hidden — it stays visible via the ungrouped list.
-                StreamRule::AudioLanguage { op, values } => match probe_data {
-                    None => MatchOutcome::PassThrough,
-                    Some(pd) => {
-                        let wanted: Vec<String> = values
+                // Figure out which audio languages this source is known to
+                // have, from whichever signal is available — real probe data
+                // (ffprobe) when we have it, otherwise pre-probe hints (the
+                // release filename via `hunch`, and the addon's Stremio
+                // `bingeGroup`, e.g. "...|WEBRip|Russian" — computed by the
+                // addon from its own source metadata, so it also catches
+                // releases the filename gives no clue about at all, like a
+                // non-Latin-script title `hunch` can't parse). A source only
+                // gets probed once it's actually been selected for playback,
+                // so on a fresh, never-played item there's usually no real
+                // probe yet — that's exactly the case the pre-probe hints
+                // exist for. A failed/unreachable probe still leaves
+                // `Some(MediaSourceInfo)` behind, but as an empty
+                // `filename_guess` stub with no MediaStreams at all, which
+                // must not be mistaken for "confirmed no languages" just
+                // because it's `Some`.
+                StreamRule::AudioLanguage { op, values } => {
+                    let wanted: Vec<String> = values
+                        .iter()
+                        .map(|v| normalize_lang_code(v))
+                        .collect();
+
+                    let has_real_audio_probe = probe_data.is_some_and(|pd| {
+                        pd.media_streams
                             .iter()
-                            .map(|v| normalize_lang_code(v))
-                            .collect();
-                        let hit = pd
-                            .media_streams
+                            .any(|s| s.type_ == Some(MediaStreamType::Audio))
+                    });
+                    // Special "no-linguistic-content" codes are kept in the
+                    // list rather than dropped: they simply never appear in
+                    // `wanted`, so they naturally never count as a match —
+                    // but they still count as "we have real probe data" so
+                    // an audio-only-"und" source doesn't fall through to
+                    // PassThrough as if it were completely unprobed.
+                    let known_langs: Vec<String> = if let Some(pd) =
+                        probe_data.filter(|_| has_real_audio_probe)
+                    {
+                        pd.media_streams
                             .iter()
-                            .any(|s| {
-                                s.type_ == Some(MediaStreamType::Audio)
-                                    && s.language
-                                        .as_deref()
-                                        .map_or(false, |l| {
-                                            let l = normalize_lang_code(l);
-                                            !matches!(
-                                                l.as_str(),
-                                                "und" | "mis" | "zxx" | "mul"
-                                            ) && wanted.contains(&l)
-                                        })
-                            });
-                        bool_to_outcome(matches!(op, SetOp::In | SetOp::Is) == hit)
+                            .filter(|s| s.type_ == Some(MediaStreamType::Audio))
+                            .filter_map(|s| s.language.as_deref())
+                            .map(normalize_lang_code)
+                            .collect()
+                    } else {
+                        let mut detected: Vec<String> = Vec::new();
+                        if let Some(filename) = &info.filename {
+                            let parsed = hunch::hunch(filename);
+                            detected.extend(
+                                parsed
+                                    .languages()
+                                    .iter()
+                                    .map(|l| l.to_lowercase()),
+                            );
+                        }
+                        if let Some(bg) = &info.binge_group {
+                            // `bingeGroup` is an opaque, addon-defined string
+                            // (e.g. "...|torbox|false|1080p|WEBRip|Russian")
+                            // — most of its pipe-delimited segments are
+                            // provider ids, cache flags or quality tags, not
+                            // languages. Only keep segments that are
+                            // themselves a recognized language name, so they
+                            // don't pollute the "every known track is
+                            // excluded" check below with junk that can never
+                            // be "wanted" (which would make NotIn's
+                            // Russian-only detection never actually fire).
+                            let known_names: Vec<String> = common_audio_languages()
+                                .iter()
+                                .map(|(_, name)| name.to_lowercase())
+                                .collect();
+                            detected.extend(
+                                bg.split('|')
+                                    .map(|s| {
+                                        s.trim()
+                                            .to_lowercase()
+                                    })
+                                    .filter(|s| known_names.contains(s)),
+                            );
+                        }
+                        // These come back as display names ("Russian"), not
+                        // ISO codes — normalize by comparing against the
+                        // wanted list's own display names below instead of
+                        // trying to reverse-map them to codes here.
+                        detected
+                    };
+
+                    if known_langs.is_empty() {
+                        return MatchOutcome::PassThrough;
                     }
-                },
+
+                    // `wanted` holds ISO codes (probe path); the pre-probe
+                    // path's `known_langs` holds lowercase display names
+                    // instead, so compare against both spellings of `wanted`.
+                    let wanted_names: Vec<String> = wanted
+                        .iter()
+                        .map(|c| {
+                            language_label(c)
+                                .to_lowercase()
+                        })
+                        .collect();
+                    let is_wanted = |l: &String| {
+                        wanted.contains(l) || wanted_names.contains(l)
+                    };
+
+                    match op {
+                        // "must include" — unchanged: matches if any known
+                        // track is one of the wanted languages.
+                        SetOp::In | SetOp::Is => bool_to_outcome(
+                            known_langs
+                                .iter()
+                                .any(is_wanted),
+                        ),
+                        // "exclude" — a source with a mix of languages (e.g.
+                        // Russian *and* English) must NOT be excluded just
+                        // because one of its tracks is unwanted: there's a
+                        // perfectly good alternative track, and it's
+                        // `audio_language_preference` (in `UserConfiguration`)
+                        // that then makes sure that alternative — not
+                        // whatever the container itself marks as default —
+                        // is what actually gets selected. Only reject
+                        // (NoMatch) when *every* known track is in the
+                        // excluded set, i.e. there's no acceptable
+                        // alternative at all.
+                        SetOp::NotIn | SetOp::IsNot => {
+                            let all_excluded = known_langs
+                                .iter()
+                                .all(is_wanted);
+                            bool_to_outcome(!all_excluded)
+                        }
+                    }
+                }
                 // Unknown size (None) passes through, consistent with Size's
                 // original semantics and the AudioLanguage behavior above.
                 StreamRule::Size { op, value } => match info.size {
@@ -959,6 +1059,93 @@ mod tests {
         assert_eq!(
             group.match_outcome(&info("a.mkv"), Some(&probe_with_langs(&["eng"]))),
             MatchOutcome::Match
+        );
+    }
+
+    // Real production data captured live from the DB for a S.W.A.T. S08E14
+    // release that briefly slipped past the filter in production — a full
+    // JSON round-trip (not a hand-built fixture) through the real
+    // deserialization path, to guard against a future serde/rename
+    // regression that a hand-built `MediaStream { .. }` fixture can't catch.
+    #[test]
+    fn real_world_e14_dual_audio_json_round_trip_is_kept() {
+        let stream_info: StreamInfo = serde_json::from_str(include_str!(
+            "real_streaminfo_e14.json"
+        ))
+        .expect("stream_info must deserialize");
+        let probe_data: crate::api::MediaSourceInfo = serde_json::from_str(
+            include_str!("real_probe_e14.json"),
+        )
+        .expect("probe_data must deserialize");
+
+        // A dual rus+eng release must be kept: eng is a perfectly good
+        // alternative, so this isn't a "no acceptable audio" case.
+        let group = group_audio_lang(SetOp::NotIn, &["rus"]);
+        assert_eq!(
+            group.match_outcome(&stream_info, Some(&probe_data)),
+            MatchOutcome::Match
+        );
+    }
+
+    // Real-world case: a genuine dual-audio (Russian+English) release whose
+    // filename is full of dots ("S.W.A.T.S08E13...") — must be KEPT (English
+    // is a fine alternative track; `audio_language_preference` is what then
+    // makes sure it's the one actually selected, not the container's own
+    // embedded default). Also exercises the outer `detect_stream_quality`
+    // guard, which runs first for every rule and must not bail early on a
+    // dotted filename like this.
+    #[test]
+    fn audio_lang_notin_keeps_real_dual_audio_release_with_dotted_filename() {
+        let group = group_audio_lang(SetOp::NotIn, &["rus"]);
+        let real_info = info(
+            "S.W.A.T.S08E13.High.Ground.1080p.AMZN.WEB-DL.DDP5.1.H.264.Rus.Eng.mkv",
+        );
+        let probe = probe_with_langs(&["rus", "eng"]);
+        assert_eq!(
+            group.match_outcome(&real_info, Some(&probe)),
+            MatchOutcome::Match,
+            "dual rus+eng probe must be kept by NotIn [rus] — eng is an acceptable alternative"
+        );
+    }
+
+    // Same real release, but via the pre-probe fallback (no probe_data yet) —
+    // exercises the binge_group hint path directly. Same expectation: kept.
+    #[test]
+    fn audio_lang_notin_keeps_real_release_via_binge_group_fallback() {
+        let group = group_audio_lang(SetOp::NotIn, &["rus"]);
+        let mut real_info = info(
+            "S.W.A.T.S08E13.High.Ground.1080p.AMZN.WEB-DL.DDP5.1.H.264.Rus.Eng.mkv",
+        );
+        real_info.binge_group = Some(
+            "com.aiostreams.viren070|torbox|false|1080p|WEB-DL|AVC|DD+|English|Russian"
+                .to_string(),
+        );
+        assert_eq!(
+            group.match_outcome(&real_info, None),
+            MatchOutcome::Match,
+            "binge_group fallback must keep this dual-language release"
+        );
+    }
+
+    // A source with *no* acceptable alternative — audio is Russian only —
+    // must still be rejected, both via a real probe and via the pre-probe
+    // binge_group fallback.
+    #[test]
+    fn audio_lang_notin_rejects_russian_only_release() {
+        let group = group_audio_lang(SetOp::NotIn, &["rus"]);
+        assert_eq!(
+            group.match_outcome(&info("a.mkv"), Some(&probe_with_langs(&["rus"]))),
+            MatchOutcome::NoMatch,
+            "probe: russian-only has no acceptable alternative"
+        );
+
+        let mut fallback_info = info("Movie.2025.WEBRip.Rus.mkv");
+        fallback_info.binge_group =
+            Some("com.aiostreams.viren070|torbox|false|WEBRip|Russian".to_string());
+        assert_eq!(
+            group.match_outcome(&fallback_info, None),
+            MatchOutcome::NoMatch,
+            "fallback: russian-only has no acceptable alternative"
         );
     }
 

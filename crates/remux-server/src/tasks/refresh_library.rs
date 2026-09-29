@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{
     ProgressReporter, Task, TaskCategory, TaskService,
     catalog_import_shared::{
-        import_catalog_items, prune_orphaned_playlists,
+        ensure_catalog_collection, import_catalog_items, prune_orphaned_playlists,
         remove_stale_catalog_memberships,
     },
 };
@@ -149,6 +149,10 @@ impl Task for RefreshLibraryTask {
 
             let full_id = &cat_info.catalog_id;
             valid_collection_ids.insert(cat_info.collection_id);
+
+            if let Err(e) = ensure_catalog_collection(&ctx, cat_info).await {
+                warn!(catalog = %full_id, error = %e, "failed to ensure collection row for catalog");
+            }
 
             let source = match ctx
                 .addons

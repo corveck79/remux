@@ -1673,10 +1673,12 @@ async fn item_for_user(
     let subtitle_mode = encoding_cfg
         .subtitle_mode
         .unwrap_or_default();
-    // Clients that switch versions (Android TV) refetch the item by MediaSource id
-    // and then play MediaSources[0], so the requested group must end up first and
+    // Clients that switch versions (Android TV, and the web version-picker
+    // dropdown) refetch the item by MediaSource id and then play
+    // MediaSources[0], so the requested group/stream must end up first and
     // keep its own UUID instead of the item id stamped by `db_media_to_item`.
     let mut requested_group: Option<Uuid> = None;
+    let mut requested_stream: Option<Uuid> = None;
     let resolved_id = match MediaResolveService::resolve_item(id, &state.ctx).await? {
         Some(m) if m.kind == db::MediaKind::StreamGroup => {
             requested_group = Some(m.id);
@@ -1694,6 +1696,19 @@ async fn item_for_user(
                 m.id,
             )
             .context_not_found("stream group not yet associated with an item")?
+        }
+        // A specific ungrouped source was requested directly by its own raw
+        // stream id — same "switch versions" flow as above, just without a
+        // StreamGroup in between. Resolve back to the real parent (Movie/
+        // Episode) so the details page keeps its actual title, overview and
+        // artwork instead of the addon's raw formatted stream name and no
+        // metadata at all (the symptom: picking a version blanked the whole
+        // page). Remember which stream was asked for so it still ends up
+        // selected/first, same as the StreamGroup case.
+        Some(m) if m.kind == db::MediaKind::Stream => {
+            requested_stream = Some(m.id);
+            m.parent_id
+                .context_not_found("stream has no parent item")?
         }
         Some(m) => m.id,
         None => return Ok(None),
@@ -1855,10 +1870,24 @@ async fn item_for_user(
                     requested_group = None;
                 }
             }
+        } else if let Some(sid) = requested_stream {
+            match filtered
+                .iter()
+                .position(|s| s.id == sid)
+            {
+                Some(pos) => {
+                    let source = filtered.remove(pos);
+                    filtered.insert(0, source);
+                }
+                None => {
+                    warn!(%sid, item = %media.id, "requested stream has no matching source");
+                    requested_stream = None;
+                }
+            }
         }
         media.sources = Some(filtered);
 
-        if requested_group.is_none() {
+        if requested_group.is_none() && requested_stream.is_none() {
             if let Some(sources) = media
                 .sources
                 .as_mut()
@@ -1936,7 +1965,7 @@ async fn item_for_user(
         }
         media.sources = Some(filtered);
 
-        if requested_group.is_none() {
+        if requested_group.is_none() && requested_stream.is_none() {
             if let Some(sources) = media
                 .sources
                 .as_mut()
@@ -2158,6 +2187,29 @@ async fn item_for_user(
         {
             source.id = gid;
             source.e_tag = gid;
+        }
+    }
+
+    // Same undo, for a specific ungrouped stream requested directly by id:
+    // without this, re-navigating by the stamped item id would resolve back
+    // to whatever source ranks first by default instead of staying on the
+    // one the user actually picked from the version list.
+    let hoisted_stream = requested_stream.filter(|sid| {
+        media
+            .sources
+            .as_ref()
+            .and_then(|s| s.first())
+            .map(|s| s.id)
+            == Some(*sid)
+    });
+    if let Some(sid) = hoisted_stream {
+        if let Some(source) = base_item
+            .media_sources
+            .as_mut()
+            .and_then(|s| s.first_mut())
+        {
+            source.id = sid;
+            source.e_tag = sid;
         }
     }
 
@@ -6133,6 +6185,123 @@ mod tests {
                 .simple()
                 .to_string(),
             "the item itself is still the parent movie"
+        );
+    }
+
+    /// Regression: navigating to an individual, *ungrouped* source's own raw
+    /// stream id (e.g. clicking a non-default entry in the web version-picker
+    /// dropdown) must resolve back to the real parent item — same title,
+    /// overview, images — not render the addon's raw formatted stream name
+    /// with no other metadata. The requested stream must still end up
+    /// MediaSources[0], keeping its own UUID.
+    #[tokio::test]
+    async fn test_items_get_by_ungrouped_stream_id_resolves_to_parent_and_hoists_it() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
+        let now = Utc::now().naive_utc();
+
+        let movie =
+            insert_media(&ctx.db, "Test Movie", db::MediaKind::Movie, "tt7777777")
+                .await;
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(movie.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+
+        let mut stream_ids = vec![];
+        for (idx, filename) in [
+            (0, "🚀 FHD Test Movie WEB-DL x264.mkv"),
+            (1, "🚀 FHD Test Movie BluRay x265.mkv"),
+        ] {
+            let mut stream = db::Media {
+                title: filename.to_string(),
+                kind: db::MediaKind::Stream,
+                parent_id: Some(movie.id),
+                idx: Some(idx),
+                stream_info: Some(crate::stream::StreamInfo {
+                    descriptor: crate::stream::StreamDescriptor::Local(filename.into()),
+                    filename: Some(filename.to_string()),
+                    ..Default::default()
+                }),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            stream
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            stream_ids.push(stream.id);
+        }
+        let second_stream_id = stream_ids[1];
+
+        // Baseline: navigating to the movie itself.
+        let resp = server
+            .get(&format!("/items/{}", movie.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["MediaSources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Simulate clicking the second (non-default) entry in the version
+        // picker: navigate directly to its own raw stream id.
+        let resp2 = server
+            .get(&format!("/items/{}", second_stream_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp2.assert_status_ok();
+        let body2: serde_json::Value = resp2.json();
+
+        assert_eq!(
+            body2["Id"]
+                .as_str()
+                .unwrap(),
+            movie
+                .id
+                .simple()
+                .to_string(),
+            "must resolve back to the real parent movie, not the raw stream row"
+        );
+        assert_eq!(
+            body2["Name"]
+                .as_str()
+                .unwrap(),
+            "Test Movie",
+            "must keep the real title, not the addon's raw formatted stream name"
+        );
+        let sources2 = body2["MediaSources"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            sources2.len(),
+            2,
+            "the full version list must stay available"
+        );
+        assert_eq!(
+            sources2[0]["Id"]
+                .as_str()
+                .unwrap(),
+            second_stream_id
+                .simple()
+                .to_string(),
+            "the requested stream must be MediaSources[0] and keep its own UUID, \
+             not the item id, so the client sends it back on PlaybackInfo"
         );
     }
 

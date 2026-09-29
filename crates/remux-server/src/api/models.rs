@@ -428,7 +428,16 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             | db::MediaKind::Episode
             | db::MediaKind::TvChannel
             | db::MediaKind::TvProgram
-            | db::MediaKind::Intro => MediaType::Video,
+            | db::MediaKind::Intro
+            // A `Stream`/`StreamGroup` row is a raw addon-provided source
+            // candidate (or its collapsed group representative) — jellyfin-web
+            // fetches these directly as "alternate version" items, keyed off
+            // this field to decide the details page renders a proper
+            // playable-video layout. Falling into the `_ => Other` catch-all
+            // below (serialized as "Unknown") makes it render the bare
+            // fallback layout instead (title text only, no Play button).
+            | db::MediaKind::Stream
+            | db::MediaKind::StreamGroup => MediaType::Video,
             db::MediaKind::Track => MediaType::Audio,
             db::MediaKind::Playlist => match media.collection_media_kind {
                 Some(db::CollectionMediaKind::Music) => MediaType::Audio,
@@ -1226,4 +1235,31 @@ pub struct RemoteSubtitleInfo {
     pub is_hash_match: Option<bool>,
     pub ai_translated: Option<bool>,
     pub machine_translated: Option<bool>,
+}
+
+#[cfg(test)]
+mod media_type_tests {
+    use super::*;
+
+    // A `Stream`/`StreamGroup` row (a raw addon source candidate, or its
+    // collapsed group representative) is a directly playable "alternate
+    // version" item, same as jellyfin-web expects for Movie/Episode. Falling
+    // into the generic `Other` MediaType (serialized as "Unknown") made the
+    // details page render the bare fallback layout instead of a proper
+    // playable-video page with a Play button — regression coverage for that.
+    #[test]
+    fn stream_and_stream_group_kinds_map_to_video_media_type() {
+        for kind in [db::MediaKind::Stream, db::MediaKind::StreamGroup] {
+            let media = db::Media {
+                kind: kind.clone(),
+                ..Default::default()
+            };
+            let item = db_media_to_item(media, false);
+            assert_eq!(
+                item.media_type,
+                MediaType::Video,
+                "{kind:?} must map to MediaType::Video, not Other/Unknown"
+            );
+        }
+    }
 }

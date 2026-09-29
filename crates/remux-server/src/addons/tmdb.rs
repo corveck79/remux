@@ -642,7 +642,7 @@ fn tmdb_client(
         .with_shared_rate_limit(common::tmdb_rate_limit()))
 }
 
-async fn tmdb_client_from_ctx(
+pub(crate) async fn tmdb_client_from_ctx(
     ctx: &AppContext,
 ) -> Result<sdks::RestClient<sdks::BearerAuth>> {
     // Cache the client after first build to avoid querying the DB for the

@@ -636,6 +636,16 @@ pub struct Config {
     /// tracing spans to. `None` (the default) disables tracing export
     /// entirely — normal log output is unaffected either way.
     pub otlp_endpoint: Option<String>,
+    /// Trakt OAuth app credentials (device-code flow — no redirect URI
+    /// needed). `TRAKT_CLIENT_ID` / `TRAKT_CLIENT_SECRET`. `None` disables
+    /// the built-in Trakt media-tracker addon (`TraktPreset::from_cfg`
+    /// errors if it's enabled anyway).
+    pub trakt_client_id: Option<String>,
+    /// Never serialized: `init_app` logs the full `Config` at startup
+    /// (`info!("config: {}", serde_json::to_string_pretty(&config)...)`),
+    /// and a secret has no business in a log file.
+    #[serde(skip_serializing)]
+    pub trakt_client_secret: Option<String>,
 }
 
 fn default_jellyfin_version() -> String {
@@ -763,6 +773,8 @@ impl Default for Config {
             activity_log_retention_days: default_activity_log_retention_days(),
             jellyfin_version: default_jellyfin_version(),
             otlp_endpoint: None,
+            trakt_client_id: None,
+            trakt_client_secret: None,
         }
         .resolve()
     }

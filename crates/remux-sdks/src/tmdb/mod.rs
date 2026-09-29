@@ -586,4 +586,22 @@ impl Endpoint for AllMovieWatchProvidersEndpoint {
     }
 }
 
+/// `GET /network/{network_id}` — a TV network's own profile, including its
+/// logo. A different, much higher-resolution/transparent-background asset
+/// set than the small flat icons `watch/providers/*` returns (those are
+/// capped at 332x332 with an opaque background tile, meant for a JustWatch-
+/// style provider grid, not for use as a poster/backdrop-sized image).
+#[derive(Debug, Clone, Serialize)]
+pub struct GetNetworkEndpoint {
+    pub network_id: u64,
+}
+
+impl Endpoint for GetNetworkEndpoint {
+    type Output = Network;
+
+    fn path(&self) -> String {
+        format!("network/{}", self.network_id)
+    }
+}
+
 //https://files.tmdb.org/p/exports/movie_ids_05_15_2024.json.gz

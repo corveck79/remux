@@ -6,7 +6,162 @@ use tracing::{Instrument, debug, debug_span, error, info, warn};
 use uuid::Uuid;
 
 use super::ProgressReporter;
-use crate::{AppContext, addons::ResolvedCatalog, db};
+use crate::{AppContext, addons::ResolvedCatalog, db, sdks};
+
+/// A Stremio-style catalog's `name` is built as
+/// `"{manifest_name} — {catalog_name} — {KindLabel}"` (see
+/// `StremioAddon::catalog_list`) — useful to disambiguate catalogs in addon
+/// settings, but the manifest name (e.g. "AIOStreams") is noise in a
+/// collection tile. Pulls out just the catalog's own name.
+fn catalog_display_name(cat_info: &ResolvedCatalog) -> &str {
+    let parts: Vec<&str> = cat_info
+        .name
+        .split(" — ")
+        .collect();
+    if parts.len() >= 3 {
+        parts[1].trim()
+    } else {
+        cat_info
+            .name
+            .trim()
+    }
+}
+
+/// A clean, human title for the collection: the catalog's own name, with a
+/// "Movies"/"Shows" suffix so a movie and series catalog that would
+/// otherwise share a name (most do) don't also share a title — unless the
+/// name already reads that way itself (e.g. "Netflix Top 10 Movies
+/// (Global)").
+fn collection_title(cat_info: &ResolvedCatalog) -> String {
+    let base = catalog_display_name(cat_info);
+    // Word-boundary check, not a raw substring one — "SkyShowtime" contains
+    // "show" too, and a raw `.contains("show")` would wrongly treat that as
+    // already disambiguated, leaving both its movie and series catalogs
+    // titled identically "SkyShowtime" with nothing to tell them apart.
+    let already_disambiguated = base
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| {
+            matches!(
+                word.to_lowercase().as_str(),
+                "movie" | "movies" | "show" | "shows" | "series"
+            )
+        });
+    if already_disambiguated {
+        return base.to_string();
+    }
+    match cat_info.media_kind {
+        Some(db::MediaKind::Movie) => format!("{base} Movies"),
+        Some(db::MediaKind::Series) => format!("{base} Shows"),
+        _ => base.to_string(),
+    }
+}
+
+/// Streaming-service networks recognized as their own collection — the
+/// exact catalog name (as `catalog_display_name` returns it, before the
+/// Movies/Shows suffix is added), case-insensitive. Anything not listed
+/// here (Popular/Trending/Featured/New/Year/Language/Netflix Top 10/etc,
+/// generic facets an addon exposes as if they were their own catalogs) is
+/// excluded from getting a collection at all — Collections is meant to show
+/// the networks themselves, not every filter an addon happens to expose.
+///
+/// Each name here must also be one `provider_wordmark()`
+/// (`services/image.rs`) recognizes, so the collection's poster gets that
+/// bundled, correctly-proportioned wordmark drawn as an overlay on its
+/// generated poster grid — see `ensure_catalog_collection`. A brand that
+/// isn't in `provider_wordmark()`'s list still gets its own collection (its
+/// items are real and worth browsing), it just renders without a logo
+/// overlay on the poster, same as any collection with an unrecognized
+/// provider name typed into the dashboard's own overlay picker.
+const KNOWN_NETWORKS: &[&str] = &[
+    "netflix",
+    "hbo max",
+    "disney+",
+    "prime video",
+    "apple tv+",
+    "hulu",
+    "paramount+",
+    "starz",
+    "skyshowtime",
+];
+
+/// Ensures a `Media{kind: Collection}` row exists at `cat_info.collection_id`
+/// before items get linked to it — `import_catalog_items` below only ever
+/// writes `media_relations` rows *against* that id, on the assumption a
+/// collection already lives there (true for one hand-created up front, never
+/// true for a catalog an addon config newly exposes). Without this, such a
+/// catalog's items import into the library fine but the collection itself
+/// never appears: orphaned membership rows pointing at a row that was never
+/// created.
+///
+/// The collection's `collection_image_config` is set to draw the network's
+/// own wordmark (`CollectionOverlay::StreamingLogo`, the same mechanism the
+/// dashboard's own collection-image editor uses) over its generated poster
+/// grid — that grid is rendered lazily, from the real posters of whatever
+/// items end up linked to this collection, so it's deliberately not
+/// generated here: at this point in `RefreshLibraryTask`'s loop, no items
+/// have been imported into it yet.
+///
+/// Never touches a row that already exists — a collection the user has since
+/// renamed, promoted, or otherwise customized (including one of these
+/// auto-created ones) is left alone on every later run.
+pub async fn ensure_catalog_collection(
+    ctx: &AppContext,
+    cat_info: &ResolvedCatalog,
+) -> Result<()> {
+    let network = catalog_display_name(cat_info);
+    if !KNOWN_NETWORKS
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(network))
+    {
+        return Ok(());
+    }
+    if cat_info.collection_id == Uuid::nil() {
+        return Ok(());
+    }
+    if db::Media::get_by_id(&ctx.db, &cat_info.collection_id)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let title = collection_title(cat_info);
+    let now = chrono::Utc::now().naive_utc();
+    let mut collection = db::Media {
+        id: cat_info.collection_id,
+        kind: db::MediaKind::Collection,
+        title: title.clone(),
+        // `Manual`, not `Smart`: membership comes from real `media_relations`
+        // rows this same import writes (role='collection'), not a smart
+        // filter rule — a `Smart` collection with no `collection_smart_filter`
+        // set browses as "everything in the library", which is exactly the
+        // wrong-content bug this specific choice avoids.
+        collection_kind: Some(db::CollectionKind::Manual),
+        collection_media_kind: cat_info
+            .collection_media_kind
+            .clone(),
+        collection_image_config: Some(sdks::remux::CollectionImageConfig {
+            overlay: sdks::remux::CollectionOverlay::StreamingLogo {
+                provider_id: 0,
+                provider_name: Some(network.to_string()),
+                logo_path: None,
+            },
+            ..Default::default()
+        }),
+        created_at: now,
+        updated_at: now,
+        ..Default::default()
+    };
+    collection
+        .save(&ctx.db)
+        .await?;
+    info!(
+        catalog = %cat_info.catalog_id,
+        title = %title,
+        "created collection for new addon catalog"
+    );
+
+    Ok(())
+}
 
 /// Consume `stream`, fetching metadata + full tree for new items and upserting everything.
 ///
@@ -84,7 +239,15 @@ where
             break;
         }
 
-        // Only process top-level content kinds.
+        // Only process top-level content kinds. Also drops AIOStreams' (and
+        // possibly other Stremio-protocol addons') synthetic error items —
+        // a lookup failure returned as if it were an ordinary catalog entry,
+        // titled e.g. "[❌] The Movie Database" — before one can be saved as
+        // if it were real content. `ExternalIds::from_stremio_id` already
+        // keeps this id from contaminating a *real* item's identity on a
+        // failed refresh; this is the catalog-import side of the same
+        // problem, where nothing else here has anything stremio-specific to
+        // reject a synthetic item on.
         items.retain(|m| {
             matches!(
                 m.kind,
@@ -95,7 +258,9 @@ where
                     | db::MediaKind::Album
                     | db::MediaKind::Track
                     | db::MediaKind::Playlist
-            )
+            ) && !m
+                .title
+                .starts_with("[❌]")
         });
 
         // A playlist carries its tracks in `relations`, which take(max) above
@@ -316,35 +481,58 @@ where
 
             // 4 bind params/row; chunk well under SQLite's ~999 bound-parameter limit.
             const RELATION_CHUNK: usize = 200;
-            for rows in relation_rows.chunks(RELATION_CHUNK) {
-                debug!(catalog_id = %collection_id, count = rows.len(), "batch-inserting catalog relations");
-                // SQLite doesn't support naming columns of a VALUES table-value
-                // constructor (`AS v(a, b)`); its anonymous columns are referenced
-                // as column1, column2, ... in binding order.
-                let mut qb = sqlx::QueryBuilder::new(
-                    "INSERT INTO media_relations (relation_id, left_media_id, right_media_id, role, weight) \
-                     SELECT v.column1, v.column2, media.id, 'catalog', v.column3 FROM (",
-                );
-                qb.push_values(
-                    rows.iter(),
-                    |mut b, (relation_id, collection_id, weight, item_id)| {
-                        b.push_bind(relation_id)
-                            .push_bind(collection_id)
-                            .push_bind(weight)
-                            .push_bind(item_id);
-                    },
-                );
-                qb.push(
-                    ") AS v \
-                     JOIN media ON media.id = v.column4 \
-                     ON CONFLICT (left_media_id, right_media_id, COALESCE(role, '')) DO UPDATE SET weight = excluded.weight",
-                );
-                if let Err(e) = qb
-                    .build()
-                    .execute(&ctx.db)
-                    .await
-                {
-                    error!(catalog = media_id, error = %e, "failed to record catalog membership batch");
+            // Written under two roles: 'catalog' is this function's own
+            // membership bookkeeping (the staleness pruning above and below,
+            // and `update_addon_catalogs`'s tag propagation), while
+            // 'collection' is what actually makes the collection browsable —
+            // it's the same role a user's own manual "add to collection"
+            // writes, so a catalog-populated collection behaves exactly like
+            // an ordinary manual one that happens to be kept in sync
+            // automatically. 'catalog' alone was silently browsable-empty:
+            // `MediaFilter::parent`-driven collection browsing
+            // (`get_by_filter_inner`'s `is_manual_collection` branch) only
+            // ever looks for role = 'collection'.
+            for role in ["catalog", "collection"] {
+                for rows in relation_rows.chunks(RELATION_CHUNK) {
+                    debug!(catalog_id = %collection_id, role, count = rows.len(), "batch-inserting catalog relations");
+                    // SQLite doesn't support naming columns of a VALUES table-value
+                    // constructor (`AS v(a, b)`); its anonymous columns are referenced
+                    // as column1, column2, ... in binding order.
+                    let mut qb = sqlx::QueryBuilder::new(
+                        "INSERT INTO media_relations (relation_id, left_media_id, right_media_id, role, weight) \
+                         SELECT v.column1, v.column2, media.id, ",
+                    );
+                    qb.push_bind(role);
+                    qb.push(", v.column3 FROM (");
+                    qb.push_values(
+                        rows.iter(),
+                        |mut b, (relation_id, collection_id, weight, item_id)| {
+                            // A role-specific id: the base one (used for
+                            // 'catalog') would collide with the 'collection'
+                            // row for the same pair otherwise.
+                            let relation_id = if role == "catalog" {
+                                *relation_id
+                            } else {
+                                Uuid::new_v5(relation_id, role.as_bytes())
+                            };
+                            b.push_bind(relation_id)
+                                .push_bind(collection_id)
+                                .push_bind(weight)
+                                .push_bind(item_id);
+                        },
+                    );
+                    qb.push(
+                        ") AS v \
+                         JOIN media ON media.id = v.column4 \
+                         ON CONFLICT (left_media_id, right_media_id, COALESCE(role, '')) DO UPDATE SET weight = excluded.weight",
+                    );
+                    if let Err(e) = qb
+                        .build()
+                        .execute(&ctx.db)
+                        .await
+                    {
+                        error!(catalog = media_id, role, error = %e, "failed to record catalog membership batch");
+                    }
                 }
             }
 
@@ -431,13 +619,18 @@ where
                 count = stale.len(),
                 "removing stale catalog members"
             );
-            const STALE_CHUNK: usize = 900;
+            // Both roles this catalog writes for a member (see the insert
+            // loop above) — 'catalog' is membership bookkeeping, 'collection'
+            // is what actually makes it show up when browsing the
+            // collection, and a stale item must lose both or it would keep
+            // appearing to a user browsing the collection forever.
+            const STALE_CHUNK: usize = 450;
             for chunk in stale.chunks(STALE_CHUNK) {
                 let mut qb = sqlx::QueryBuilder::new(
                     "DELETE FROM media_relations WHERE left_media_id = ",
                 );
                 qb.push_bind(collection_id);
-                qb.push(" AND role = 'catalog' AND right_media_id IN (");
+                qb.push(" AND role IN ('catalog', 'collection') AND right_media_id IN (");
                 let mut sep = qb.separated(", ");
                 for id in chunk {
                     sep.push_bind(id);
@@ -500,8 +693,11 @@ pub async fn remove_stale_catalog_memberships(
 
     info!(count = stale.len(), "removing stale catalog memberships");
     for collection_id in stale {
+        // Both roles a member is written under (see `import_catalog_items`'s
+        // insert loop) — 'collection' too, or the collection would still
+        // list every item that came from this now-gone catalog.
         if let Err(e) = sqlx::query(
-            "DELETE FROM media_relations WHERE left_media_id = ? AND role = 'catalog'",
+            "DELETE FROM media_relations WHERE left_media_id = ? AND role IN ('catalog', 'collection')",
         )
         .bind(collection_id)
         .execute(db)
