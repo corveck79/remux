@@ -2031,6 +2031,27 @@ async fn item_for_user(
         .await;
     }
 
+    // The list above is a filename guess for sources nobody has probed yet. Probe the best
+    // one in the background so the next view shows its real audio/subtitle tracks.
+    if needs_streams
+        && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
+        && let Some(top) = media
+            .sources
+            .as_deref()
+            .and_then(|sources| sources.first())
+    {
+        let timeout_secs = db::Settings::get_config_or_default(&state.ctx.db)
+            .await
+            .probe_timeout_secs
+            .unwrap_or(20) as u64;
+        crate::playback::probe::details_probe::spawn(
+            top.clone(),
+            timeout_secs,
+            state.ctx.config.port,
+            state.ctx.db.clone(),
+        );
+    }
+
     // When streams were actually fetched but none found, replace the
     // listing-style stubs with a single "No streams found" stub. Must run
     // before the resolve/label blocks below so they operate on this final

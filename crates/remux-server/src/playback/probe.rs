@@ -1238,6 +1238,122 @@ pub(crate) async fn probe_stream(
     }
 }
 
+/// Background probing of the top source when an item's details are opened.
+///
+/// Items without RemuxDB data only have a guess from the release filename
+/// (at most one audio track, no languages) until the first playback probes
+/// them. Probing the best source in the background right when the details page
+/// is requested makes the real track list available on the next view, for every
+/// client. It is throttled: one source per request, at most [`MAX_PARALLEL`] at
+/// the same time, and a source is not retried within [`COOLDOWN`].
+pub(crate) mod details_probe {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    use tokio::sync::Semaphore;
+
+    const MAX_PARALLEL: usize = 2;
+    const COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+    /// Remembers when a source was last attempted so repeated page opens do not
+    /// hammer the stream provider.
+    #[derive(Default)]
+    pub(crate) struct Throttle {
+        last_attempt: Mutex<HashMap<Uuid, Instant>>,
+    }
+
+    impl Throttle {
+        /// True when the source may be probed now; records the attempt.
+        pub(crate) fn try_start(&self, id: Uuid, now: Instant) -> bool {
+            let mut map = self
+                .last_attempt
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(prev) = map.get(&id) {
+                if now.duration_since(*prev) < COOLDOWN {
+                    return false;
+                }
+            }
+            // Keep the map small: forget attempts that are long past their cooldown.
+            map.retain(|_, t| now.duration_since(*t) < COOLDOWN * 4);
+            map.insert(id, now);
+            true
+        }
+    }
+
+    /// A source needs a real probe when it has no probe data or only a filename guess.
+    pub(crate) fn needs_real_probe(stream: &db::Media) -> bool {
+        stream.stream_info.is_some()
+            && stream
+                .probe_data
+                .as_ref()
+                .map_or(true, |pd| pd.is_filename_guess() || pd.video_stream().is_none())
+    }
+
+    fn throttle() -> &'static Throttle {
+        static T: OnceLock<Throttle> = OnceLock::new();
+        T.get_or_init(Throttle::default)
+    }
+
+    fn permits() -> &'static Semaphore {
+        static S: OnceLock<Semaphore> = OnceLock::new();
+        S.get_or_init(|| Semaphore::new(MAX_PARALLEL))
+    }
+
+    /// Start a background probe for `stream` when it still lacks real probe data.
+    /// Returns immediately; a successful probe is persisted by `probe_stream`.
+    pub(crate) fn spawn(stream: db::Media, timeout_secs: u64, port: u16, db: sqlx::SqlitePool) {
+        if !needs_real_probe(&stream) || !throttle().try_start(stream.id, Instant::now()) {
+            return;
+        }
+        tokio::spawn(async move {
+            let Ok(_permit) = permits().acquire().await else {
+                return;
+            };
+            let url = stream
+                .stream_info
+                .as_ref()
+                .map(|si| si.descriptor.server_input(stream.id, port));
+            debug!(id = %stream.id, "details: probing top source in the background");
+            // No fallback to other streams: this probe is only about this source's tracks.
+            let result = probe_stream(
+                &stream, url, false, timeout_secs, false, 0, &[], false, port, &db,
+            )
+            .await;
+            match result {
+                Ok(_) => debug!(id = %stream.id, "details: background probe done"),
+                Err(e) => debug!(id = %stream.id, error = ?e, "details: background probe failed"),
+            }
+        });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn throttle_allows_one_attempt_per_cooldown() {
+            let t = Throttle::default();
+            let id = Uuid::new_v4();
+            let start = Instant::now();
+
+            assert!(t.try_start(id, start));
+            assert!(!t.try_start(id, start + Duration::from_secs(60)));
+            assert!(!t.try_start(id, start + COOLDOWN - Duration::from_secs(1)));
+            assert!(t.try_start(id, start + COOLDOWN + Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn throttle_tracks_sources_separately() {
+            let t = Throttle::default();
+            let now = Instant::now();
+
+            assert!(t.try_start(Uuid::new_v4(), now));
+            assert!(t.try_start(Uuid::new_v4(), now));
+        }
+    }
+}
+
 fn select_candidates(
     primary: &db::Media,
     probe_pool: &[db::Media],
